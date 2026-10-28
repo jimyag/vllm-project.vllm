@@ -1614,7 +1614,16 @@ class EngineCoreProc(EngineCore):
         # (e.g. WAITING_FOR_REMOTE_KVS or delayed KV connector frees), yield
         # the GIL briefly to allow background transfer threads to make progress.
         if not model_executed and self.scheduler.has_requests():
-            time.sleep(0.001)
+            rate_wait = self.scheduler.get_output_rate_wait_seconds()
+            if rate_wait > 0:
+                try:
+                    request = self.input_queue.get(timeout=rate_wait)
+                except queue.Empty:
+                    pass
+                else:
+                    self._handle_client_request(*request)
+            else:
+                time.sleep(0.001)
 
         return model_executed
 

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from vllm.inputs import (
     DecoderOnlyEngineInput,
@@ -13,6 +14,18 @@ from vllm.inputs import (
 )
 from vllm.logprobs import Logprob
 from vllm.lora.request import LoRARequest
+
+if TYPE_CHECKING:
+    from vllm.config import VllmConfig
+
+
+def validate_beam_search_output_rate(vllm_config: "VllmConfig") -> None:
+    """Reject beam expansion that bypasses per-user output accounting."""
+    if vllm_config.scheduler_config.default_user_output_tokens_per_second is not None:
+        raise ValueError(
+            "Beam search is not supported when user output rate limiting is enabled. "
+            "Set use_beam_search=False to use ordinary sampling."
+        )
 
 
 @dataclass

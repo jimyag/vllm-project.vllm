@@ -2,21 +2,28 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Callable, Sequence
+from http import HTTPStatus
+from types import SimpleNamespace
 from typing import Any, cast
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import torch
 
 from vllm import CompletionOutput, PromptType, RequestOutput, SamplingParams
 from vllm import logger as vllm_logger
-from vllm.config import VllmConfig
+from vllm.config import SchedulerConfig, VllmConfig
 from vllm.entrypoints.generate.beam_search.offline import BeamSearchOfflineMixin
 from vllm.entrypoints.generate.beam_search.online import BeamSearchOnlineMixin
 from vllm.entrypoints.generate.beam_search.utils import (
     BeamSearchInstance,
     BeamSearchSequence,
 )
+from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
+from vllm.entrypoints.openai.chat_completion.serving import OpenAIServingChat
+from vllm.entrypoints.openai.completion.protocol import CompletionRequest
+from vllm.entrypoints.openai.completion.serving import OpenAIServingCompletion
+from vllm.entrypoints.serve.engine.protocol import ErrorResponse
 from vllm.inputs import EngineInput, TokensInput
 from vllm.logprobs import Logprob, SampleLogprobs
 from vllm.sampling_params import BeamSearchParams
@@ -50,6 +57,7 @@ class _Renderer:
 class _VllmConfig:
     watermark_config = object()
     speculative_config = None
+    scheduler_config = SchedulerConfig.default_factory()
 
     def _check_supports_watermarking(self, params: BeamSearchParams) -> bool:
         return VllmConfig._check_supports_watermarking(cast(VllmConfig, self), params)
@@ -64,6 +72,7 @@ class _InputProcessor:
 
 class _EngineClient:
     input_processor = _InputProcessor()
+    vllm_config = input_processor.vllm_config
 
     async def generate(self, prompt, *args, **kwargs):
         assert args[0].watermarking is False
@@ -128,6 +137,101 @@ class _OfflineServing(BeamSearchOfflineMixin):
     ) -> bool:
         assert base_sampling_params.watermarking is False
         return True
+
+
+@pytest.mark.asyncio
+async def test_online_beam_search_rejects_output_rate_limit(monkeypatch) -> None:
+    serving = _AsyncServing()
+    monkeypatch.setattr(
+        serving.engine_client.vllm_config.scheduler_config,
+        "default_user_output_tokens_per_second",
+        1,
+    )
+    generate = MagicMock(side_effect=AssertionError("Beam reached engine generation"))
+    monkeypatch.setattr(serving.engine_client, "generate", generate)
+
+    with pytest.raises(ValueError, match="Beam search.*output rate limiting"):
+        await anext(
+            serving.beam_search(
+                {"type": "token", "prompt_token_ids": [1]},
+                "request",
+                BeamSearchParams(beam_width=2, max_tokens=1, watermarking=False),
+            )
+        )
+
+    generate.assert_not_called()
+
+
+def test_offline_beam_search_rejects_output_rate_limit(monkeypatch) -> None:
+    serving = _OfflineServing()
+    monkeypatch.setattr(
+        serving.llm_engine.vllm_config.scheduler_config,
+        "default_user_output_tokens_per_second",
+        1,
+    )
+    beam_step = MagicMock(side_effect=AssertionError("Beam reached engine generation"))
+    monkeypatch.setattr(serving, "_beam_search_step", beam_step)
+
+    with pytest.raises(ValueError, match="Beam search.*output rate limiting"):
+        serving.beam_search(
+            cast(list[PromptType], [{"type": "token", "prompt_token_ids": [1]}]),
+            BeamSearchParams(beam_width=2, max_tokens=1, watermarking=False),
+        )
+
+    beam_step.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("api", ["chat", "completion"])
+@pytest.mark.parametrize(
+    "rate,use_beam_search",
+    [(1, True), (None, True), (1, False)],
+    ids=["reject-beam", "disabled-beam", "ordinary-sampling"],
+)
+async def test_beam_output_rate_render_admission(api, rate, use_beam_search) -> None:
+    scheduler_config = SchedulerConfig.default_factory(
+        default_user_output_tokens_per_second=rate
+    )
+    engine = MagicMock(vllm_config=SimpleNamespace(scheduler_config=scheduler_config))
+    kwargs = {
+        "model": "test-model",
+        "use_beam_search": use_beam_search,
+        "vllm_xargs": {"output_rate_user": "alice"},
+    }
+    if api == "chat":
+        serving = object.__new__(OpenAIServingChat)
+        request = ChatCompletionRequest(
+            messages=[{"role": "user", "content": "test"}], **kwargs
+        )
+        rendered = ([], [])
+        render = "render_chat"
+        render_request = serving.render_chat_request
+    else:
+        serving = object.__new__(OpenAIServingCompletion)
+        request = CompletionRequest(prompt="test", **kwargs)
+        rendered = []
+        render = "render_completion"
+        render_request = serving.render_completion_request
+    serving.engine_client = engine
+    serving._check_model = AsyncMock(return_value=None)
+    serving._preflight = MagicMock()
+    renderer = AsyncMock(return_value=rendered)
+    serving.online_renderer = SimpleNamespace(**{render: renderer})
+
+    result = await render_request(request)
+
+    if rate is not None and use_beam_search:
+        assert isinstance(result, ErrorResponse)
+        assert result.error.code == HTTPStatus.BAD_REQUEST
+        assert result.error.param == "use_beam_search"
+        assert "Beam search" in result.error.message
+        serving._check_model.assert_not_awaited()
+        serving._preflight.assert_not_called()
+        renderer.assert_not_awaited()
+    else:
+        assert result is rendered
+        renderer.assert_awaited_once_with(request)
+    engine.generate.assert_not_called()
 
 
 @pytest.mark.asyncio

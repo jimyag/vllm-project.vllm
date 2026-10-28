@@ -82,6 +82,8 @@ def create_scheduler(
     runner: RunnerOption = "auto",
     per_request_spec_decode_metrics: str = "none",
     scheduling_policy: SchedulerPolicy = "fcfs",
+    default_user_output_tokens_per_second: int | None = None,
+    user_output_tokens_per_second: dict[str, int] | None = None,
     diffusion_canvas_length: int | None = None,
     scheduler_cls: type[Scheduler] | None = None,
 ) -> Scheduler | AsyncScheduler:
@@ -133,6 +135,8 @@ def create_scheduler(
         # Ensure admission/preemption mechanics are deterministic
         watermark=0.0,
         policy=scheduling_policy,
+        default_user_output_tokens_per_second=default_user_output_tokens_per_second,
+        user_output_tokens_per_second=user_output_tokens_per_second or {},
     )
     # Cache config, optionally force APC
     cache_config = CacheConfig(

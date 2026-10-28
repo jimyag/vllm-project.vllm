@@ -15,6 +15,7 @@ from transformers import AutoModelForSeq2SeqLM
 
 from vllm import CompletionOutput, RequestOutput
 from vllm.assets.audio import AudioAsset
+from vllm.config import SchedulerConfig
 from vllm.entrypoints.llm import LLM
 from vllm.inputs import TokensInput
 from vllm.logprobs import Logprob, SampleLogprobs
@@ -98,7 +99,9 @@ def test_beam_search_abort_returns_partial_outputs_and_continues_other_prompts(
         return results
 
     llm = LLM.__new__(LLM)
-    llm.llm_engine = Mock()
+    llm.llm_engine = Mock(
+        vllm_config=SimpleNamespace(scheduler_config=SchedulerConfig.default_factory())
+    )
     tokenizer = SimpleNamespace(
         eos_token_id=0,
         decode=lambda tokens, skip_special_tokens=False: " ".join(

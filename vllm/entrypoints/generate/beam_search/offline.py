@@ -26,6 +26,7 @@ from .utils import (
     BeamSearchOutput,
     BeamSearchSequence,
     create_sort_beams_key_function,
+    validate_beam_search_output_rate,
 )
 
 logger = init_logger(__name__)
@@ -75,6 +76,7 @@ class BeamSearchOfflineMixin(OfflineInferenceMixin):
                 If None, the number of concurrent requests is unlimited.
 
         """
+        validate_beam_search_output_rate(self.llm_engine.vllm_config)
         # TODO: how does beam search work together with length penalty,
         # frequency, penalty, and stopping criteria, etc.?
         beam_width = params.beam_width
