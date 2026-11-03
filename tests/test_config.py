@@ -3474,31 +3474,20 @@ def user_output_rate_config():
 
 
 @pytest.mark.skip_global_cleanup
-@pytest.mark.parametrize("async_scheduling", [None, False])
-def test_user_output_rate_limit_uses_sync_scheduling(
+@pytest.mark.parametrize("async_scheduling", [None, False, True])
+def test_user_output_rate_limit_keeps_async_scheduling(
     user_output_rate_config, async_scheduling
 ):
     scheduler_config = user_output_rate_config.scheduler_config
     scheduler_config.async_scheduling = async_scheduling
     VllmConfig._verify_user_output_rate_config(user_output_rate_config)
-    assert scheduler_config.async_scheduling is False
-
-
-@pytest.mark.skip_global_cleanup
-def test_disabled_user_output_rate_limit_preserves_async(user_output_rate_config):
-    scheduler_config = user_output_rate_config.scheduler_config
-    scheduler_config.default_user_output_tokens_per_second = None
-    scheduler_config.user_output_tokens_per_second = {}
-    scheduler_config.async_scheduling = True
-    VllmConfig._verify_user_output_rate_config(user_output_rate_config)
-    assert scheduler_config.async_scheduling is True
+    assert scheduler_config.async_scheduling is async_scheduling
 
 
 @pytest.mark.skip_global_cleanup
 @pytest.mark.parametrize(
     "section,field,value,error",
     [
-        ("scheduler_config", "async_scheduling", True, "async_scheduling=False"),
         ("scheduler_config", "scheduler_cls", "custom.Scheduler", "built-in"),
         ("parallel_config", "data_parallel_size", 2, "data_parallel_size=1"),
         ("parallel_config", "pipeline_parallel_size", 2, "pipeline_parallel_size=1"),

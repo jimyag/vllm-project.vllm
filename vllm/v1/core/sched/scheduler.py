@@ -47,7 +47,7 @@ from vllm.v1.core.sched.output import (
     ScheduledEncoderInputStats,
     SchedulerOutput,
 )
-from vllm.v1.core.sched.output_rate import RollingOutputBudget
+from vllm.v1.core.sched.output_rate import OutputRateLimiter
 from vllm.v1.core.sched.request_queue import (
     RequestQueue,
     SchedulingPolicy,
@@ -97,15 +97,16 @@ class Scheduler(SchedulerInterface):
         self.vllm_config = vllm_config
         self.scheduler_config = vllm_config.scheduler_config
         output_rate = self.scheduler_config.default_user_output_tokens_per_second
-        self.output_rate_budget = (
-            RollingOutputBudget(
+        self.output_rate_limiter = (
+            OutputRateLimiter(
                 output_rate,
                 self.scheduler_config.user_output_tokens_per_second,
             )
             if output_rate is not None
             else None
         )
-        self._output_rate_reserved: dict[str, str] = {}
+        # Outputs charged in the current schedule() call, keyed by request ID.
+        self._output_rate_charged: dict[str, str] = {}
         self._output_rate_wakeup_ns: int | None = None
         self._output_rate_last_served: dict[str, str] = {}
         self.cache_config = vllm_config.cache_config
@@ -611,29 +612,35 @@ class Scheduler(SchedulerInterface):
             raise ValueError("output_rate_user must be a non-empty string")
         return user
 
-    def _reserve_output_rate(
+    def _charge_output_rate(
         self, request: Request, num_computed_tokens: int, num_new_tokens: int
     ) -> bool:
-        budget = self.output_rate_budget
-        if budget is None or num_computed_tokens + num_new_tokens < request.num_tokens:
+        # A step samples only once it reaches the end of the known tokens; with
+        # async scheduling num_computed_tokens already includes placeholders.
+        # Charging at dispatch needs no result from the previous step, so the
+        # scheduler may run ahead of the model. An output discarded after a
+        # stop in a lookahead step stays charged, which errs on the safe side.
+        limiter = self.output_rate_limiter
+        if limiter is None or num_computed_tokens + num_new_tokens < request.num_tokens:
+            return True
+        if request.request_id in self._output_rate_charged:
             return True
         user = self._output_rate_user(request)
-        if budget.reserve(request.request_id, user):
-            self._output_rate_reserved[request.request_id] = user
+        if limiter.try_take(user):
+            self._output_rate_charged[request.request_id] = user
             return True
-        ready_at = budget.ready_at_ns(user)
-        if ready_at is not None:
-            self._output_rate_wakeup_ns = (
-                ready_at
-                if self._output_rate_wakeup_ns is None
-                else min(ready_at, self._output_rate_wakeup_ns)
-            )
+        ready_at = limiter.ready_at_ns(user)
+        self._output_rate_wakeup_ns = (
+            ready_at
+            if self._output_rate_wakeup_ns is None
+            else min(ready_at, self._output_rate_wakeup_ns)
+        )
         return False
 
     def _limit_output_rate_tokens(
         self, request: Request, num_computed_tokens: int, num_new_tokens: int
     ) -> int:
-        if self._reserve_output_rate(request, num_computed_tokens, num_new_tokens):
+        if self._charge_output_rate(request, num_computed_tokens, num_new_tokens):
             return num_new_tokens
         if not self.scheduler_config.enable_chunked_prefill:
             return 0
@@ -641,11 +648,15 @@ class Scheduler(SchedulerInterface):
         # Leave that position for a later step rather than blocking all input.
         return min(num_new_tokens, max(0, request.num_tokens - num_computed_tokens - 1))
 
-    def _release_output_rate(self, request_id: str) -> None:
-        if request_id in self._output_rate_reserved:
-            assert self.output_rate_budget is not None
-            self.output_rate_budget.finish(request_id, 0)
-            del self._output_rate_reserved[request_id]
+    def _settle_output_rate_charges(self, num_scheduled_tokens: dict[str, int]) -> None:
+        assert self.output_rate_limiter is not None
+        for request_id, user in self._output_rate_charged.items():
+            if request_id in num_scheduled_tokens:
+                self._output_rate_last_served[user] = request_id
+            else:
+                # Charged, then dropped by allocation failure or preemption.
+                self.output_rate_limiter.refund(user)
+        self._output_rate_charged.clear()
 
     def get_output_rate_wait_seconds(self) -> float:
         if self._output_rate_wakeup_ns is None:
@@ -676,14 +687,10 @@ class Scheduler(SchedulerInterface):
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self._output_rate_wakeup_ns = None
-        if self.output_rate_budget is not None:
-            if self._output_rate_reserved:
-                raise RuntimeError(
-                    "Output rate scheduling requires a completed prior step"
-                )
+        if self.output_rate_limiter is not None:
             self._rotate_output_rate_requests()
             if self.current_step % 256 == 0:
-                self.output_rate_budget.cleanup_idle_users()
+                self.output_rate_limiter.cleanup_idle_users()
                 active_users = {
                     self._output_rate_user(request)
                     for request in self.requests.values()
@@ -758,11 +765,23 @@ class Scheduler(SchedulerInterface):
                 long_prefill_token_threshold, input_budget // num_eligible_reqs
             )
 
+        # Running requests skipped for output rate keep KV and a worker slot,
+        # but leave the batch: they do not count toward max_num_active_reqs
+        # and are preferred as preemption victims.
+        output_rate_throttled: set[Request] = set()
+
         # First, schedule the RUNNING requests.
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
             if input_budget <= draft_slots:
+                break
+            if (
+                self.output_rate_limiter is not None
+                and len(scheduled_running_reqs) >= self.max_num_active_reqs
+            ):
+                # Throttled requests let RUNNING exceed the active limit; cap
+                # the batch instead. Later requests wait for earlier ones.
                 break
 
             if (
@@ -880,6 +899,7 @@ class Scheduler(SchedulerInterface):
                 request, request.num_computed_tokens, num_new_tokens
             )
             if num_new_tokens == 0:
+                output_rate_throttled.add(request)
                 req_index += 1
                 continue
 
@@ -907,7 +927,20 @@ class Scheduler(SchedulerInterface):
                     if self.policy == SchedulingPolicy.PRIORITY:
                         preempted_req = max(
                             self.running,
-                            key=lambda r: (r.priority, r.arrival_time),
+                            key=lambda r: (
+                                r.priority,
+                                r in output_rate_throttled,
+                                r.arrival_time,
+                            ),
+                        )
+                    elif output_rate_throttled:
+                        preempted_req = next(
+                            (
+                                r
+                                for r in reversed(self.running)
+                                if r in output_rate_throttled
+                            ),
+                            self.running[-1],
                         )
                     else:
                         preempted_req = self.running[-1]
@@ -942,7 +975,14 @@ class Scheduler(SchedulerInterface):
                                 )
                                 encoder_compute_budget += num_embeds_to_restore
                     else:
-                        preempted_req = self.running.pop()
+                        # The victim is the tail or a throttled request skipped
+                        # earlier in this pass; neither was scheduled, so only
+                        # the index shifts.
+                        victim_index = self.running.index(preempted_req)
+                        del self.running[victim_index]
+                        if victim_index < req_index:
+                            req_index -= 1
+                    output_rate_throttled.discard(preempted_req)
 
                     self._preempt_request(
                         preempted_req,
@@ -1031,6 +1071,10 @@ class Scheduler(SchedulerInterface):
                 # Paused streaming sessions (WAITING_FOR_STREAMING_REQ) are not
                 # in `running` but still hold a model-runner request slot.
                 num_running = len(self.running) + self.num_waiting_for_streaming_input
+                if output_rate_throttled:
+                    if num_running >= self.max_num_running_reqs:
+                        break
+                    num_running -= len(output_rate_throttled)
                 if num_running >= self.max_num_active_reqs:
                     break
 
@@ -1519,10 +1563,8 @@ class Scheduler(SchedulerInterface):
                 _, num_waiting = self.get_request_counts()
                 self.prefill_capacity_bound = num_waiting > len(self.deferred_waiting)
 
-        if self.output_rate_budget is not None:
-            for request_id in tuple(self._output_rate_reserved):
-                if request_id not in num_scheduled_tokens:
-                    self._release_output_rate(request_id)
+        if self.output_rate_limiter is not None:
+            self._settle_output_rate_charges(num_scheduled_tokens)
 
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
@@ -1705,7 +1747,6 @@ class Scheduler(SchedulerInterface):
         tokens out of order, and for connectors with a pending KV hand-off,
         which the preemption's block free would leave without valid KV.
         """
-        self._release_output_rate(request.request_id)
         assert request.status == RequestStatus.RUNNING, (
             "Only running requests can be preempted"
         )
@@ -2154,20 +2195,6 @@ class Scheduler(SchedulerInterface):
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
         sampled_token_ids = model_runner_output.sampled_token_ids
-        if self.output_rate_budget is not None:
-            # Abort handling may already have removed the Request. Account for
-            # sampled tokens before stop/grammar handling can trim their lists.
-            for request_id, user in tuple(self._output_rate_reserved.items()):
-                index = model_runner_output.req_id_to_index.get(request_id)
-                count = (
-                    len(sampled_token_ids[index])
-                    if index is not None and sampled_token_ids
-                    else 0
-                )
-                self.output_rate_budget.finish(request_id, count)
-                del self._output_rate_reserved[request_id]
-                if count:
-                    self._output_rate_last_served[user] = request_id
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
         prompt_token_id_logprobs_dict = (

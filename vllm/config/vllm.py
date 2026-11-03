@@ -1416,11 +1416,6 @@ class VllmConfig:
         if scheduler_config.default_user_output_tokens_per_second is None:
             return
 
-        if scheduler_config.async_scheduling is True:
-            raise ValueError(
-                "User output rate limiting requires async_scheduling=False. "
-                "Use --no-async-scheduling."
-            )
         if self.speculative_config is not None:
             raise ValueError(
                 "User output rate limiting does not support speculative decoding."
@@ -1476,7 +1471,6 @@ class VllmConfig:
                 "User output rate limiting requires the built-in Scheduler. "
                 "Leave scheduler_cls unset."
             )
-        scheduler_config.async_scheduling = False
 
     def __post_init__(self):
         """Verify configs are valid & consistent with each other."""

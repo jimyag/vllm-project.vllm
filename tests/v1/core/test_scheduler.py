@@ -49,7 +49,7 @@ from vllm.v1.core.sched.diffusion_scheduler import (
 )
 from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
-from vllm.v1.core.sched.output_rate import RollingOutputBudget
+from vllm.v1.core.sched.output_rate import OutputRateLimiter
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
 from vllm.v1.engine import FinishReason
@@ -296,16 +296,21 @@ def output_rate_clock() -> _OutputRateClock:
 
 def _set_output_rate_clock(
     scheduler: Scheduler, clock: _OutputRateClock
-) -> RollingOutputBudget:
+) -> OutputRateLimiter:
     config = scheduler.scheduler_config
     assert config.default_user_output_tokens_per_second is not None
-    budget = RollingOutputBudget(
+    limiter = OutputRateLimiter(
         config.default_user_output_tokens_per_second,
         config.user_output_tokens_per_second,
         clock=clock,
     )
-    scheduler.output_rate_budget = budget
-    return budget
+    scheduler.output_rate_limiter = limiter
+    return limiter
+
+
+# With the default 100 ms burst, a 1 token/s user who sampled at t=0 may sample
+# again at 0.9 s.
+_NEXT_OUTPUT_NS = 900_000_000
 
 
 def _set_output_rate_user(request: Request, user: str) -> None:
@@ -319,9 +324,9 @@ def test_output_rate_combines_streams_and_preserves_independent_users(
 ) -> None:
     scheduler = create_scheduler(
         default_user_output_tokens_per_second=1,
-        user_output_tokens_per_second={"B": 2},
+        user_output_tokens_per_second={"B": 20},
     )
-    budget = _set_output_rate_clock(scheduler, output_rate_clock)
+    limiter = _set_output_rate_clock(scheduler, output_rate_clock)
     requests = create_requests(4, req_ids=["a-0", "a-1", "b-0", "b-1"])
     for request, user in zip(requests, ["A", "A", "B", "B"]):
         _set_output_rate_user(request, user)
@@ -329,9 +334,11 @@ def test_output_rate_combines_streams_and_preserves_independent_users(
 
     output = scheduler.schedule()
     assert set(output.num_scheduled_tokens) == {"a-0", "a-1", "b-0", "b-1"}
+    # a-1 shares A's single output and stops before its sampling position.
     assert output.num_scheduled_tokens["a-1"] == requests[1].num_prompt_tokens - 1
-    assert budget.statistics("A").inflight_count == 1
-    assert budget.statistics("B").inflight_count == 2
+    assert limiter.ready_at_ns("A") == _NEXT_OUTPUT_NS
+    # B's 20 tokens/s and 100 ms burst admit 3 outputs at once; 2 are charged.
+    assert limiter.ready_at_ns("B") == 0
     _model_output(
         scheduler,
         output,
@@ -340,9 +347,8 @@ def test_output_rate_combines_streams_and_preserves_independent_users(
             for request_id in output.num_scheduled_tokens
         ],
     )
-    assert budget.statistics("A").completed_count == 1
-    assert budget.statistics("B").completed_count == 2
-    assert scheduler.schedule().total_num_scheduled_tokens == 0
+    # Charging needs no settlement: B keeps its last burst output.
+    assert set(scheduler.schedule().num_scheduled_tokens) == {"b-0"}
 
 
 def test_output_rate_empty_step_recovers_at_rolling_ns_boundary(
@@ -357,7 +363,8 @@ def test_output_rate_empty_step_recovers_at_rolling_ns_boundary(
     blocked = scheduler.schedule()
     assert blocked.num_scheduled_tokens == {}
     assert blocked.total_num_scheduled_tokens == 0
-    output_rate_clock.now_ns = 999_999_999
+    assert scheduler._output_rate_wakeup_ns == _NEXT_OUTPUT_NS
+    output_rate_clock.now_ns = _NEXT_OUTPUT_NS - 1
     assert scheduler.schedule().total_num_scheduled_tokens == 0
     output_rate_clock.now_ns += 1
     assert scheduler.schedule().num_scheduled_tokens == {request.request_id: 1}
@@ -372,7 +379,7 @@ def test_output_rate_partial_prefill_runs_without_spending_output_quota(
         max_model_len=64,
         default_user_output_tokens_per_second=1,
     )
-    budget = _set_output_rate_clock(scheduler, output_rate_clock)
+    limiter = _set_output_rate_clock(scheduler, output_rate_clock)
     (short,) = create_requests(1, num_tokens=4, req_ids=["short"])
     scheduler.add_request(short)
     _model_output(scheduler, scheduler.schedule(), [[1000]])
@@ -383,14 +390,14 @@ def test_output_rate_partial_prefill_runs_without_spending_output_quota(
         output = scheduler.schedule()
         assert output.num_scheduled_tokens == {"long": chunk_size}
         _model_output(scheduler, output, [[]])
-        stats = budget.statistics("__anonymous__")
-        assert (stats.inflight_count, stats.completed_count) == (0, 1)
+        assert limiter.ready_at_ns("__anonymous__") == _NEXT_OUTPUT_NS
     assert long.num_computed_tokens == 9
     assert scheduler.schedule().total_num_scheduled_tokens == 0
-    output_rate_clock.now_ns = 1_000_000_000
+    output_rate_clock.now_ns = _NEXT_OUTPUT_NS
     resumed = scheduler.schedule()
     assert resumed.num_scheduled_tokens == {"long": 1}
-    assert budget.statistics("__anonymous__").inflight_count == 1
+    # Outputs stay one second apart: the second charge moves the TAT to 2 s.
+    assert limiter.ready_at_ns("__anonymous__") == 1_900_000_000
 
 
 def test_output_rate_preserves_non_chunked_prefill(
@@ -418,7 +425,7 @@ def test_output_rate_preserves_non_chunked_prefill(
 
     assert scheduler.schedule().num_scheduled_tokens == {}
     assert prefix.num_computed_tokens == 0
-    output_rate_clock.now_ns = 1_000_000_000
+    output_rate_clock.now_ns = _NEXT_OUTPUT_NS
     assert scheduler.schedule().num_scheduled_tokens == {"prefix": 10}
 
 
@@ -430,7 +437,7 @@ def test_output_rate_prefix_cache_hit_still_reserves_first_output(
         block_size=16,
         default_user_output_tokens_per_second=1,
     )
-    budget = _set_output_rate_clock(scheduler, output_rate_clock)
+    limiter = _set_output_rate_clock(scheduler, output_rate_clock)
     seed, hit = create_requests(
         2, num_tokens=33, max_tokens=1, same_prompt=True, req_ids=["seed", "hit"]
     )
@@ -439,14 +446,11 @@ def test_output_rate_prefix_cache_hit_still_reserves_first_output(
     scheduler.add_request(hit)
 
     assert scheduler.schedule().total_num_scheduled_tokens == 0
-    output_rate_clock.now_ns = 1_000_000_000
+    output_rate_clock.now_ns = _NEXT_OUTPUT_NS
     output = scheduler.schedule()
     assert output.num_scheduled_tokens == {"hit": 1}
     assert output.scheduled_new_reqs[0].num_computed_tokens == 32
-    assert budget.statistics("__anonymous__").inflight_count == 1
-    _model_output(scheduler, output, [[1000]])
-    assert budget.statistics("__anonymous__").completed_count == 1
-    assert budget.available("__anonymous__") == 0
+    assert not limiter.try_take("__anonymous__")
 
 
 @pytest.mark.parametrize("running", [False, True])
@@ -454,17 +458,17 @@ def test_output_rate_allocation_failure_refunds_unsent_work(
     output_rate_clock: _OutputRateClock, running: bool
 ) -> None:
     scheduler = create_scheduler(default_user_output_tokens_per_second=1)
-    budget = _set_output_rate_clock(scheduler, output_rate_clock)
+    limiter = _set_output_rate_clock(scheduler, output_rate_clock)
     (request,) = create_requests(1)
     scheduler.add_request(request)
     if running:
         _model_output(scheduler, scheduler.schedule(), [[1000]])
-        output_rate_clock.now_ns = 1_000_000_000
+        output_rate_clock.now_ns = _NEXT_OUTPUT_NS
+    ready_at = limiter.ready_at_ns("__anonymous__")
 
     with patch.object(scheduler.kv_cache_manager, "allocate_slots", return_value=None):
         assert scheduler.schedule().total_num_scheduled_tokens == 0
-    stats = budget.statistics("__anonymous__")
-    assert (stats.inflight_count, stats.completed_count, stats.available) == (0, 0, 1)
+    assert limiter.ready_at_ns("__anonymous__") == ready_at
     assert request.request_id in scheduler.schedule().num_scheduled_tokens
 
 
@@ -479,7 +483,7 @@ def test_output_rate_priority_preemption_refunds_removed_reservation(
         scheduling_policy="priority",
         default_user_output_tokens_per_second=1,
     )
-    budget = _set_output_rate_clock(scheduler, output_rate_clock)
+    limiter = _set_output_rate_clock(scheduler, output_rate_clock)
     (low,) = create_requests(1, num_tokens=32, req_ids=["low"])
     low.priority = 5
     _set_output_rate_user(low, "low-user")
@@ -498,33 +502,27 @@ def test_output_rate_priority_preemption_refunds_removed_reservation(
     output = scheduler.schedule()
     assert output.num_scheduled_tokens == {"high": 1}
     assert low.status == RequestStatus.PREEMPTED
-    assert budget.statistics("low-user").inflight_count == 0
-    assert budget.available("low-user") == 1
-    assert budget.statistics("high-user").inflight_count == 1
-    _model_output(scheduler, output, [[1000]])
-    assert budget.statistics("high-user").completed_count == 1
+    # low was charged, then preempted by high; the tail refunds its output.
+    assert limiter.try_take("low-user")
+    assert not limiter.try_take("high-user")
 
 
-def test_output_rate_abort_before_runner_completion_charges_raw_output(
+def test_output_rate_abort_after_dispatch_keeps_the_charge(
     output_rate_clock: _OutputRateClock,
 ) -> None:
     scheduler = create_scheduler(default_user_output_tokens_per_second=1)
-    budget = _set_output_rate_clock(scheduler, output_rate_clock)
+    _set_output_rate_clock(scheduler, output_rate_clock)
     (aborted,) = create_requests(1, req_ids=["aborted"])
     scheduler.add_request(aborted)
     output = scheduler.schedule()
-    output_rate_clock.now_ns = 10_000_000_000
     scheduler.finish_requests("aborted", RequestStatus.FINISHED_ABORTED)
     assert "aborted" not in scheduler.requests
-    assert budget.statistics("__anonymous__").inflight_count == 1
-
     _model_output(scheduler, output, [[1000]])
-    stats = budget.statistics("__anonymous__")
-    assert (stats.inflight_count, stats.completed_count, stats.available) == (0, 1, 0)
+
     (next_request,) = create_requests(1, num_tokens=1, req_ids=["next"])
     scheduler.add_request(next_request)
     assert scheduler.schedule().total_num_scheduled_tokens == 0
-    output_rate_clock.now_ns = 10_999_999_999
+    output_rate_clock.now_ns = _NEXT_OUTPUT_NS - 1
     assert scheduler.schedule().total_num_scheduled_tokens == 0
     output_rate_clock.now_ns += 1
     assert "next" in scheduler.schedule().num_scheduled_tokens
@@ -567,7 +565,7 @@ def test_output_rate_equal_priority_waiting_streams_do_not_starve(
 
 def test_output_rate_disabled_preserves_unthrottled_scheduling() -> None:
     scheduler = create_scheduler()
-    assert scheduler.output_rate_budget is None
+    assert scheduler.output_rate_limiter is None
     requests = create_requests(3)
     for request in requests:
         _set_output_rate_user(request, "shared")
@@ -579,6 +577,87 @@ def test_output_rate_disabled_preserves_unthrottled_scheduling() -> None:
     assert scheduler.schedule().num_scheduled_tokens == {
         request.request_id: 1 for request in requests
     }
+
+
+def test_output_rate_async_scheduling_charges_without_settlement(
+    output_rate_clock: _OutputRateClock,
+) -> None:
+    scheduler = create_scheduler(
+        async_scheduling=True, default_user_output_tokens_per_second=10
+    )
+    limiter = _set_output_rate_clock(scheduler, output_rate_clock)
+    (request,) = create_requests(1)
+    scheduler.add_request(request)
+
+    # 10 tokens/s with a 100 ms burst admits two outputs at once. The second
+    # step is scheduled before the first result returns.
+    assert scheduler.schedule().num_scheduled_tokens == {
+        request.request_id: request.num_prompt_tokens
+    }
+    assert scheduler.schedule().num_scheduled_tokens == {request.request_id: 1}
+    assert scheduler.schedule().num_scheduled_tokens == {}
+    assert limiter.ready_at_ns("__anonymous__") == 100_000_000
+
+
+def test_output_rate_throttled_requests_leave_room_for_other_users(
+    output_rate_clock: _OutputRateClock,
+) -> None:
+    scheduler = create_scheduler(
+        max_num_seqs=3,
+        max_num_active_seqs=1,
+        default_user_output_tokens_per_second=1,
+    )
+    _set_output_rate_clock(scheduler, output_rate_clock)
+    a, b = create_requests(2, req_ids=["a", "b"])
+    _set_output_rate_user(a, "A")
+    _set_output_rate_user(b, "B")
+    scheduler.add_request(a)
+    _model_output(scheduler, scheduler.schedule(), [[1000]])
+    scheduler.add_request(b)
+
+    # A is throttled but keeps its KV and RUNNING slot; B fills the active slot.
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens == {"b": b.num_prompt_tokens}
+    assert a.status == RequestStatus.RUNNING
+    assert scheduler.running == [a, b]
+    _model_output(scheduler, output, [[1000]])
+
+    # Once both have allowance, the batch still holds one active request.
+    output_rate_clock.now_ns = _NEXT_OUTPUT_NS
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens == {"a": 1}
+    _model_output(scheduler, output, [[1000]])
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens == {"b": 1}
+
+
+def test_output_rate_preemption_prefers_throttled_requests(
+    output_rate_clock: _OutputRateClock,
+) -> None:
+    scheduler = create_scheduler(
+        max_num_seqs=3,
+        max_num_batched_tokens=200,
+        num_blocks=5,
+        block_size=16,
+        default_user_output_tokens_per_second=1,
+        user_output_tokens_per_second={"fast": 100},
+    )
+    _set_output_rate_clock(scheduler, output_rate_clock)
+    slow, fast = create_requests(2, num_tokens=32, req_ids=["slow", "fast"])
+    _set_output_rate_user(slow, "slow")
+    _set_output_rate_user(fast, "fast")
+    scheduler.add_request(slow)
+    scheduler.add_request(fast)
+    _model_output(scheduler, scheduler.schedule(), [[1000], [1000]])
+    assert scheduler.kv_cache_manager.block_pool.get_num_free_blocks() == 0
+
+    # FCFS would preempt the tail, which is `fast` itself. The throttled `slow`
+    # request is not in this batch, so its KV is the cheaper one to free.
+    output_rate_clock.now_ns = 500_000_000
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens == {"fast": 1}
+    assert slow.status == RequestStatus.PREEMPTED
+    assert scheduler.running == [fast]
 
 
 def test_pooling_chunked_prefill_can_finish_at_max_model_len():
@@ -4487,7 +4566,6 @@ def test_grammar_compile_error_finishes_only_request(async_grammar: bool):
 
 def test_abort_request_when_structured_output_fsm_cannot_advance():
     scheduler = object.__new__(Scheduler)
-    scheduler.output_rate_budget = None
     sampling_params = SamplingParams(ignore_eos=True, max_tokens=4)
     sampling_params.update_from_generation_config({}, EOS_TOKEN_ID)
 
