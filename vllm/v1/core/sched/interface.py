@@ -201,6 +201,10 @@ class SchedulerInterface(ABC):
         not yet returned in SchedulerOutputs."""
         return self.has_unfinished_requests() or self.has_finished_requests()
 
+    def get_output_rate_wait_seconds(self) -> float:
+        """Return a bounded idle wait after a quota-blocked, empty step."""
+        return 0.0
+
     @property
     @abstractmethod
     def pause_state(self) -> PauseState:

@@ -280,3 +280,14 @@ def test_extra_args_preserves_custom_objects_and_shared_containers():
     params = SamplingParams(extra_args=extra_args)
     assert params.extra_args["first"][0] is custom
     assert params.extra_args["first"] is params.extra_args["second"]
+
+
+@pytest.mark.parametrize("user", [None, "", 1, True, [], {}])
+def test_output_rate_user_rejects_invalid_identity(user):
+    with pytest.raises(VLLMValidationError, match="non-empty string"):
+        SamplingParams(extra_args={"output_rate_user": user})
+
+
+def test_output_rate_user_preserves_valid_identity():
+    params = SamplingParams(extra_args={"output_rate_user": "user-a"})
+    assert params.extra_args["output_rate_user"] == "user-a"

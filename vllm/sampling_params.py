@@ -744,6 +744,13 @@ class SamplingParams(
             )
 
     def _verify_extra_args(self) -> None:
+        if "output_rate_user" in self.extra_args:
+            user = self.extra_args["output_rate_user"]
+            if not isinstance(user, str) or not user:
+                raise VLLMValidationError(
+                    "output_rate_user must be a non-empty string.",
+                    parameter="vllm_xargs.output_rate_user",
+                )
         # JSON accepts arbitrary integers, but the engine's MessagePack
         # transport only supports signed/unsigned 64-bit integers.
         pending: list[Any] = [self.extra_args]

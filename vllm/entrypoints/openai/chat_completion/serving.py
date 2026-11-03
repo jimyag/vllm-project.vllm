@@ -25,6 +25,9 @@ from vllm.entrypoints.generate.base.serving import (
     clamp_prompt_logprobs,
     format_token_id_placeholder,
 )
+from vllm.entrypoints.generate.beam_search.utils import (
+    validate_beam_search_output_rate,
+)
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionLogProb,
     ChatCompletionLogProbs,
@@ -269,6 +272,12 @@ class OpenAIServingChat(GenerateBaseServing):
             or an ErrorResponse on failure.
 
         """
+        if request.use_beam_search:
+            try:
+                validate_beam_search_output_rate(self.engine_client.vllm_config)
+            except ValueError as exc:
+                return self.create_error_response(str(exc), param="use_beam_search")
+
         error_check_ret = await self._check_model(request)
         if error_check_ret is not None:
             logger.error("Error with model %s", error_check_ret)

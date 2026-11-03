@@ -3429,6 +3429,96 @@ def test_scheduler_config_rejects_zero_max_num_scheduled_tokens():
         SchedulerConfig.default_factory(max_num_scheduled_tokens=0)
 
 
+@pytest.mark.skip_global_cleanup
+@pytest.mark.parametrize("rate", [0, -1, True, 1.5, "10"])
+@pytest.mark.parametrize("per_user", [False, True])
+def test_user_output_rate_limit_requires_positive_integers(rate, per_user):
+    kwargs = {"default_user_output_tokens_per_second": 10}
+    if per_user:
+        kwargs["user_output_tokens_per_second"] = {"alice": rate}
+    else:
+        kwargs["default_user_output_tokens_per_second"] = rate
+    with pytest.raises(ValidationError, match="user_output_tokens_per_second"):
+        SchedulerConfig.default_factory(**kwargs)
+
+
+@pytest.mark.skip_global_cleanup
+def test_user_output_rate_overrides_require_default():
+    with pytest.raises(ValidationError, match="requires.*default_user_output"):
+        SchedulerConfig.default_factory(user_output_tokens_per_second={"alice": 20})
+
+
+@pytest.fixture
+def user_output_rate_config():
+    return SimpleNamespace(
+        scheduler_config=SchedulerConfig.default_factory(
+            default_user_output_tokens_per_second=10,
+            user_output_tokens_per_second={"alice": 20},
+        ),
+        model_config=SimpleNamespace(
+            runner_type="generate",
+            is_encoder_decoder=False,
+            is_multimodal_model=False,
+            is_diffusion=False,
+            is_hybrid=False,
+            is_attention_free=False,
+        ),
+        parallel_config=SimpleNamespace(data_parallel_size=1, pipeline_parallel_size=1),
+        cache_config=SimpleNamespace(kv_offloading_size=None),
+        speculative_config=None,
+        diffusion_config=None,
+        kv_transfer_config=None,
+        ec_transfer_config=None,
+        aux_output_config=SimpleNamespace(enabled=False),
+    )
+
+
+@pytest.mark.skip_global_cleanup
+@pytest.mark.parametrize("async_scheduling", [None, False, True])
+def test_user_output_rate_limit_keeps_async_scheduling(
+    user_output_rate_config, async_scheduling
+):
+    scheduler_config = user_output_rate_config.scheduler_config
+    scheduler_config.async_scheduling = async_scheduling
+    VllmConfig._verify_user_output_rate_config(user_output_rate_config)
+    assert scheduler_config.async_scheduling is async_scheduling
+
+
+@pytest.mark.skip_global_cleanup
+@pytest.mark.parametrize(
+    "section,field,value,error",
+    [
+        ("scheduler_config", "scheduler_cls", "custom.Scheduler", "built-in"),
+        ("parallel_config", "data_parallel_size", 2, "data_parallel_size=1"),
+        ("parallel_config", "pipeline_parallel_size", 2, "pipeline_parallel_size=1"),
+        ("model_config", "runner_type", "pooling", "generate runner"),
+        ("model_config", "is_encoder_decoder", True, "encoder-decoder"),
+        ("model_config", "is_multimodal_model", True, "multimodal"),
+        ("model_config", "is_diffusion", True, "diffusion"),
+        ("model_config", "is_hybrid", True, "standard attention decoder"),
+        ("model_config", "is_attention_free", True, "standard attention decoder"),
+        ("cache_config", "kv_offloading_size", 1, "offloading"),
+        ("aux_output_config", "enabled", True, "connectors"),
+        (None, "speculative_config", object(), "speculative decoding"),
+        (None, "diffusion_config", object(), "diffusion"),
+        (None, "kv_transfer_config", object(), "connectors"),
+        (None, "ec_transfer_config", object(), "connectors"),
+        (None, "model_config", None, "configured text-only decoder"),
+    ],
+)
+def test_user_output_rate_limit_rejects_unsupported_modes(
+    user_output_rate_config, section, field, value, error
+):
+    target = (
+        user_output_rate_config
+        if section is None
+        else getattr(user_output_rate_config, section)
+    )
+    setattr(target, field, value)
+    with pytest.raises(ValueError, match=error):
+        VllmConfig._verify_user_output_rate_config(user_output_rate_config)
+
+
 @pytest.mark.parametrize(
     (
         "model_id",

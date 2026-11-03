@@ -1411,6 +1411,67 @@ class VllmConfig:
         self.engram_config.verify_parallel_config(self.parallel_config)
         logger.info_once("Resolved Engram configuration: %s", str(self.engram_config))
 
+    def _verify_user_output_rate_config(self) -> None:
+        scheduler_config = self.scheduler_config
+        if scheduler_config.default_user_output_tokens_per_second is None:
+            return
+
+        if self.speculative_config is not None:
+            raise ValueError(
+                "User output rate limiting does not support speculative decoding."
+            )
+        if self.parallel_config.data_parallel_size != 1:
+            raise ValueError("User output rate limiting requires data_parallel_size=1.")
+        if self.parallel_config.pipeline_parallel_size != 1:
+            raise ValueError(
+                "User output rate limiting requires pipeline_parallel_size=1."
+            )
+        model_config = self.model_config
+        if (
+            model_config is None
+            or model_config.runner_type != "generate"
+            or scheduler_config.runner_type != "generate"
+        ):
+            raise ValueError(
+                "User output rate limiting requires a generate runner with "
+                "a configured text-only decoder model."
+            )
+        if model_config.is_encoder_decoder:
+            raise ValueError(
+                "User output rate limiting does not support encoder-decoder models."
+            )
+        if model_config.is_multimodal_model or scheduler_config.is_multimodal_model:
+            raise ValueError(
+                "User output rate limiting does not support multimodal models."
+            )
+        if model_config.is_hybrid or model_config.is_attention_free:
+            raise ValueError(
+                "User output rate limiting requires a standard attention decoder; "
+                "hybrid and attention-free models are not supported."
+            )
+        if model_config.is_diffusion or self.diffusion_config is not None:
+            raise ValueError(
+                "User output rate limiting does not support diffusion models."
+            )
+        if (
+            self.kv_transfer_config is not None
+            or self.ec_transfer_config is not None
+            or self.aux_output_config.enabled
+            or self.cache_config.kv_offloading_size is not None
+        ):
+            raise ValueError(
+                "User output rate limiting does not support KV, EC, or auxiliary "
+                "output connectors, including KV cache offloading."
+            )
+        if scheduler_config.scheduler_cls not in (
+            None,
+            "vllm.v1.core.sched.scheduler.Scheduler",
+        ):
+            raise ValueError(
+                "User output rate limiting requires the built-in Scheduler. "
+                "Leave scheduler_cls unset."
+            )
+
     def __post_init__(self):
         """Verify configs are valid & consistent with each other."""
         # To give each torch profile run a unique instance name.
@@ -1422,6 +1483,7 @@ class VllmConfig:
             # below unsafe (e.g. use_mla resolves the architecture registry).
             return
 
+        self._verify_user_output_rate_config()
         self._resolve_mm_encoder_only()
 
         if self.is_mm_encoder_only and self.cache_config.enable_prefix_caching:
@@ -1989,6 +2051,7 @@ class VllmConfig:
                 "to True to enable."
             )
         current_platform.check_and_update_config(self)
+        self._verify_user_output_rate_config()
 
         # After the platform hook, which has the last word on async scheduling.
         if (

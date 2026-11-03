@@ -3,7 +3,7 @@
 
 from collections.abc import Callable
 from dataclasses import InitVar
-from typing import TYPE_CHECKING, Any, ClassVar, Literal, Self, cast
+from typing import TYPE_CHECKING, Annotated, Any, ClassVar, Literal, Self, cast
 
 from pydantic import Field, field_validator
 
@@ -74,6 +74,26 @@ class SchedulerConfig:
     lowers only the number of requests that may occupy RUNNING, so decode
     batches stay smaller without shrinking runner or graph capacity. Must
     be ``<= max_num_seqs``. ``None`` (default) keeps current behavior.
+    """
+
+    default_user_output_tokens_per_second: int | None = Field(
+        default=None, gt=0, strict=True
+    )
+    """Per-user output token limit in any rolling one-second window.
+
+    ``None`` disables output rate limiting. A positive integer enables the
+    limit for every user, including users without an explicit identity, who
+    share the ``__anonymous__`` budget. Identity comes from the trusted
+    ``sampling_params.extra_args['output_rate_user']`` value.
+    """
+
+    user_output_tokens_per_second: dict[
+        str, Annotated[int, Field(gt=0, strict=True)]
+    ] = Field(default_factory=dict)
+    """Per-user overrides of ``default_user_output_tokens_per_second``.
+
+    Keys are user identities and values are positive integer limits. Overrides
+    require the default limit to be enabled; an unknown user uses that default.
     """
 
     long_prefill_token_threshold: int = Field(default=0, ge=0)
@@ -290,6 +310,15 @@ class SchedulerConfig:
         return None if value is None else handler(value)
 
     def __post_init__(self, max_model_len: int, is_encoder_decoder: bool) -> None:
+        if (
+            self.user_output_tokens_per_second
+            and self.default_user_output_tokens_per_second is None
+        ):
+            raise ValueError(
+                "user_output_tokens_per_second requires "
+                "default_user_output_tokens_per_second to be enabled."
+            )
+
         if is_encoder_decoder:
             # Chunked prefill should be disabled for encoder-decoder models.
             self.disable_chunked_mm_input = True

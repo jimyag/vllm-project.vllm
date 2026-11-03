@@ -16,7 +16,11 @@ from vllm.sampling_params import BeamSearchParams, SamplingParams
 from vllm.utils import random_uuid
 from vllm.utils.async_utils import collect_from_async_generator
 
-from .utils import BeamSearchSequence, create_sort_beams_key_function
+from .utils import (
+    BeamSearchSequence,
+    create_sort_beams_key_function,
+    validate_beam_search_output_rate,
+)
 
 
 class BeamSearchOnlineMixin(ABC):
@@ -34,6 +38,7 @@ class BeamSearchOnlineMixin(ABC):
         trace_headers: Mapping[str, str] | None = None,
         session_id: str | None = None,
     ) -> AsyncGenerator[RequestOutput, None]:
+        validate_beam_search_output_rate(self.engine_client.vllm_config)
         beam_width = params.beam_width
         max_tokens = params.max_tokens
         ignore_eos = params.ignore_eos

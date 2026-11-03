@@ -47,6 +47,7 @@ from vllm.v1.core.sched.output import (
     ScheduledEncoderInputStats,
     SchedulerOutput,
 )
+from vllm.v1.core.sched.output_rate import OutputRateLimiter
 from vllm.v1.core.sched.request_queue import (
     RequestQueue,
     SchedulingPolicy,
@@ -95,6 +96,19 @@ class Scheduler(SchedulerInterface):
     ) -> None:
         self.vllm_config = vllm_config
         self.scheduler_config = vllm_config.scheduler_config
+        output_rate = self.scheduler_config.default_user_output_tokens_per_second
+        self.output_rate_limiter = (
+            OutputRateLimiter(
+                output_rate,
+                self.scheduler_config.user_output_tokens_per_second,
+            )
+            if output_rate is not None
+            else None
+        )
+        # Outputs charged in the current schedule() call, keyed by request ID.
+        self._output_rate_charged: dict[str, str] = {}
+        self._output_rate_wakeup_ns: int | None = None
+        self._output_rate_last_served: dict[str, str] = {}
         self.cache_config = vllm_config.cache_config
         self.lora_config = vllm_config.lora_config
         self.model_uses_mrope = vllm_config.model_config.uses_mrope
@@ -588,7 +602,104 @@ class Scheduler(SchedulerInterface):
             num_new_tokens -= self.num_prefill_lookahead - remaining
         return max(num_new_tokens, 0)
 
+    @staticmethod
+    def _output_rate_user(request: Request) -> str:
+        extra_args = (
+            request.sampling_params.extra_args if request.sampling_params else None
+        )
+        user = (extra_args or {}).get("output_rate_user", "__anonymous__")
+        if not isinstance(user, str) or not user:
+            raise ValueError("output_rate_user must be a non-empty string")
+        return user
+
+    def _charge_output_rate(
+        self, request: Request, num_computed_tokens: int, num_new_tokens: int
+    ) -> bool:
+        # A step samples only once it reaches the end of the known tokens; with
+        # async scheduling num_computed_tokens already includes placeholders.
+        # Charging at dispatch needs no result from the previous step, so the
+        # scheduler may run ahead of the model. An output discarded after a
+        # stop in a lookahead step stays charged, which errs on the safe side.
+        limiter = self.output_rate_limiter
+        if limiter is None or num_computed_tokens + num_new_tokens < request.num_tokens:
+            return True
+        if request.request_id in self._output_rate_charged:
+            return True
+        user = self._output_rate_user(request)
+        if limiter.try_take(user):
+            self._output_rate_charged[request.request_id] = user
+            return True
+        ready_at = limiter.ready_at_ns(user)
+        self._output_rate_wakeup_ns = (
+            ready_at
+            if self._output_rate_wakeup_ns is None
+            else min(ready_at, self._output_rate_wakeup_ns)
+        )
+        return False
+
+    def _limit_output_rate_tokens(
+        self, request: Request, num_computed_tokens: int, num_new_tokens: int
+    ) -> int:
+        if self._charge_output_rate(request, num_computed_tokens, num_new_tokens):
+            return num_new_tokens
+        if not self.scheduler_config.enable_chunked_prefill:
+            return 0
+        # Prefill is free, but its final position also samples the first output.
+        # Leave that position for a later step rather than blocking all input.
+        return min(num_new_tokens, max(0, request.num_tokens - num_computed_tokens - 1))
+
+    def _settle_output_rate_charges(self, num_scheduled_tokens: dict[str, int]) -> None:
+        assert self.output_rate_limiter is not None
+        for request_id, user in self._output_rate_charged.items():
+            if request_id in num_scheduled_tokens:
+                self._output_rate_last_served[user] = request_id
+            else:
+                # Charged, then dropped by allocation failure or preemption.
+                self.output_rate_limiter.refund(user)
+        self._output_rate_charged.clear()
+
+    def get_output_rate_wait_seconds(self) -> float:
+        if self._output_rate_wakeup_ns is None:
+            return 0.0
+        # Poll other asynchronous readiness sources too, without blocking adds
+        # or aborts: the engine waits on its input queue, not inside schedule().
+        return min(
+            0.05,
+            max(0.0, (self._output_rate_wakeup_ns - time.monotonic_ns()) / 1e9),
+        )
+
+    def _rotate_output_rate_requests(self) -> None:
+        # Rotate only peers with the same user and priority. Other users and
+        # priority classes retain their relative positions and KV admission.
+        peers: dict[tuple[str, int], list[int]] = defaultdict(list)
+        for index, request in enumerate(self.running):
+            peers[(self._output_rate_user(request), request.priority)].append(index)
+        for (user, _), indices in peers.items():
+            last = self._output_rate_last_served.get(user)
+            requests = [self.running[index] for index in indices]
+            for offset, request in enumerate(requests):
+                if request.request_id == last:
+                    offset = (offset + 1) % len(requests)
+                    requests = requests[offset:] + requests[:offset]
+                    for index, rotated in zip(indices, requests):
+                        self.running[index] = rotated
+                    break
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+        self._output_rate_wakeup_ns = None
+        if self.output_rate_limiter is not None:
+            self._rotate_output_rate_requests()
+            if self.current_step % 256 == 0:
+                self.output_rate_limiter.cleanup_idle_users()
+                active_users = {
+                    self._output_rate_user(request)
+                    for request in self.requests.values()
+                }
+                self._output_rate_last_served = {
+                    user: request_id
+                    for user, request_id in self._output_rate_last_served.items()
+                    if user in active_users
+                }
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
@@ -654,11 +765,23 @@ class Scheduler(SchedulerInterface):
                 long_prefill_token_threshold, input_budget // num_eligible_reqs
             )
 
+        # Running requests skipped for output rate keep KV and a worker slot,
+        # but leave the batch: they do not count toward max_num_active_reqs
+        # and are preferred as preemption victims.
+        output_rate_throttled: set[Request] = set()
+
         # First, schedule the RUNNING requests.
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
             if input_budget <= draft_slots:
+                break
+            if (
+                self.output_rate_limiter is not None
+                and len(scheduled_running_reqs) >= self.max_num_active_reqs
+            ):
+                # Throttled requests let RUNNING exceed the active limit; cap
+                # the batch instead. Later requests wait for earlier ones.
                 break
 
             if (
@@ -772,6 +895,14 @@ class Scheduler(SchedulerInterface):
                 req_index += 1
                 continue
 
+            num_new_tokens = self._limit_output_rate_tokens(
+                request, request.num_computed_tokens, num_new_tokens
+            )
+            if num_new_tokens == 0:
+                output_rate_throttled.add(request)
+                req_index += 1
+                continue
+
             # Schedule newly needed KV blocks for the request.
             with record_function_or_nullcontext("schedule: allocate_slots"):
                 while True:
@@ -796,7 +927,20 @@ class Scheduler(SchedulerInterface):
                     if self.policy == SchedulingPolicy.PRIORITY:
                         preempted_req = max(
                             self.running,
-                            key=lambda r: (r.priority, r.arrival_time),
+                            key=lambda r: (
+                                r.priority,
+                                r in output_rate_throttled,
+                                r.arrival_time,
+                            ),
+                        )
+                    elif output_rate_throttled:
+                        preempted_req = next(
+                            (
+                                r
+                                for r in reversed(self.running)
+                                if r in output_rate_throttled
+                            ),
+                            self.running[-1],
                         )
                     else:
                         preempted_req = self.running[-1]
@@ -831,7 +975,14 @@ class Scheduler(SchedulerInterface):
                                 )
                                 encoder_compute_budget += num_embeds_to_restore
                     else:
-                        preempted_req = self.running.pop()
+                        # The victim is the tail or a throttled request skipped
+                        # earlier in this pass; neither was scheduled, so only
+                        # the index shifts.
+                        victim_index = self.running.index(preempted_req)
+                        del self.running[victim_index]
+                        if victim_index < req_index:
+                            req_index -= 1
+                    output_rate_throttled.discard(preempted_req)
 
                     self._preempt_request(
                         preempted_req,
@@ -920,6 +1071,10 @@ class Scheduler(SchedulerInterface):
                 # Paused streaming sessions (WAITING_FOR_STREAMING_REQ) are not
                 # in `running` but still hold a model-runner request slot.
                 num_running = len(self.running) + self.num_waiting_for_streaming_input
+                if output_rate_throttled:
+                    if num_running >= self.max_num_running_reqs:
+                        break
+                    num_running -= len(output_rate_throttled)
                 if num_running >= self.max_num_active_reqs:
                     break
 
@@ -1218,6 +1373,14 @@ class Scheduler(SchedulerInterface):
                         # The request cannot be scheduled.
                         break
 
+                if not load_kv_async:
+                    num_new_tokens = self._limit_output_rate_tokens(
+                        request, num_computed_tokens, num_new_tokens
+                    )
+                    if num_new_tokens == 0:
+                        skip_request(request_queue)
+                        continue
+
                 # During async KV load, no forward pass is run yet.
                 # Allocate speculative lookahead slots later to avoid
                 # mismatching local and remote block counts.
@@ -1399,6 +1562,9 @@ class Scheduler(SchedulerInterface):
             if not defer_prefills:
                 _, num_waiting = self.get_request_counts()
                 self.prefill_capacity_bound = num_waiting > len(self.deferred_waiting)
+
+        if self.output_rate_limiter is not None:
+            self._settle_output_rate_charges(num_scheduled_tokens)
 
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
